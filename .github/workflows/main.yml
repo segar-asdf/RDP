@@ -45,7 +45,7 @@ jobs:
           $rawPassword += $charSet.Lower | Get-Random -Count 4
           $rawPassword += $charSet.Number | Get-Random -Count 4
           $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = "2503"
+          $password = "segar25032002"
 
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           New-LocalUser -Name "SEGAR" -Password $securePass -AccountNeverExpires
