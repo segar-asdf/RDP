@@ -1,111 +1,82 @@
-name: RDP
+name: RDP-macOS
 
 on:
   workflow_dispatch:
 
 jobs:
   secure-rdp:
-    runs-on: windows-latest
+    runs-on: macos-latest
     timeout-minutes: 3600
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Create Local User with Simple Password
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+          USERNAME="segar"
+          PASSWORD="2503"
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+          # Create user if not exists
+          if ! id "$USERNAME" &>/dev/null; then
+            sudo sysadminctl -addUser "$USERNAME" -password "$PASSWORD"
+            sudo dscl . -append /Groups/admin GroupMembership "$USERNAME"
+          fi
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
-          Restart-Service -Name TermService -Force
-
-      - name: Disable Password Complexity Requirement
-        run: |
-          secedit /export /cfg $env:TEMP\secpol.cfg
-          (Get-Content $env:TEMP\secpol.cfg).Replace("PasswordComplexity = 1", "PasswordComplexity = 0") | Set-Content $env:TEMP\secpol.cfg
-          secedit /configure /db secedit.sdb /cfg $env:TEMP\secpol.cfg /areas SECURITYPOLICY
-          gpupdate /force
-
-      - name: Create RDP User with Simple Password
-        run: |
-          $password = "2503"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          
-          if (-not (Get-LocalUser -Name "SEGAR" -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name "SEGAR" -Password $securePass -AccountNeverExpires
-          }
-          
-          Add-LocalGroupMember -Group "Administrators" -Member "SEGAR" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "SEGAR" -ErrorAction SilentlyContinue
-          
-          echo "RDP_CREDS=User: SEGAR | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "SEGAR")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
+          echo "RDP_CREDS=User: $USERNAME | Password: $PASSWORD" >> $GITHUB_ENV
 
       - name: Install Tailscale
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          TS_URL="https://pkgs.tailscale.com/stable/Tailscale-latest-macos.pkg"
+          PKG_PATH="$RUNNER_TEMP/tailscale.pkg"
+
+          curl -L "$TS_URL" -o "$PKG_PATH"
+          sudo installer -pkg "$PKG_PATH" -target /
+          rm "$PKG_PATH"
+
+      - name: Install Homebrew Packages (xrdp + deps)
+        run: |
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          brew update
+          brew install xrdp
+
+      - name: Start XRDP Service
+        run: |
+          sudo brew services start xrdp
+          sleep 5
+          if ! pgrep -x "xrdp" > /dev/null; then
+            echo "XRDP failed to start"
+            exit 1
+          fi
+          echo "XRDP is running"
 
       - name: Establish Tailscale Connection
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$GITHUB_RUN_ID
           
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
-          }
-          
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
+          # Wait for IP assignment
+          TS_IP=""
+          RETRIES=0
+          while [ -z "$TS_IP" ] && [ $RETRIES -lt 10 ]; do
+            TS_IP=$(tailscale ip -4 | head -n1)
+            sleep 5
+            RETRIES=$((RETRIES+1))
+          done
 
-      - name: Maintain Connection
+          if [ -z "$TS_IP" ]; then
+            echo "Tailscale IP not assigned. Exiting."
+            exit 1
+          fi
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: Show Access Info
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: SEGAR"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
-          
-          # Keep runner active indefinitely (or until manually cancelled)
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
-          }
+          echo "=== ACCESS INFO ==="
+          echo "RDP Address: $TAILSCALE_IP:3389"
+          echo "Username: segar"
+          echo "Password: 2503"
+          echo "==================="
+
+      - name: Keep Alive
+        run: |
+          while true; do
+            echo "[$(date)] macOS RDP session active - cancel workflow to stop"
+            sleep 300
+          done
