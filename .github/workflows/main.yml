@@ -1,82 +1,70 @@
-name: RDP-macOS
+name: VNC-macOS
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp:
+  secure-vnc:
     runs-on: macos-latest
     timeout-minutes: 3600
 
     steps:
-      - name: Create Local User with Simple Password
+      - name: Enable VNC Screen Sharing
         run: |
-          USERNAME="segar"
-          PASSWORD="2503"
+          # Enable Remote Management (VNC)
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on \
+            -restart -agent -privs -all
 
-          # Create user if not exists
-          if ! id "$USERNAME" &>/dev/null; then
-            sudo sysadminctl -addUser "$USERNAME" -password "$PASSWORD"
-            sudo dscl . -append /Groups/admin GroupMembership "$USERNAME"
-          fi
+          # Enable VNC legacy mode
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -configure -clientopts -setvnclegacy -vnclegacy yes
 
-          echo "RDP_CREDS=User: $USERNAME | Password: $PASSWORD" >> $GITHUB_ENV
+          # Set VNC password (2503)
+          echo "2503" | sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -configure -clientopts -setvncpw
 
       - name: Install Tailscale
         run: |
           TS_URL="https://pkgs.tailscale.com/stable/Tailscale-latest-macos.pkg"
-          PKG_PATH="$RUNNER_TEMP/tailscale.pkg"
-
-          curl -L "$TS_URL" -o "$PKG_PATH"
-          sudo installer -pkg "$PKG_PATH" -target /
-          rm "$PKG_PATH"
-
-      - name: Install Homebrew Packages (xrdp + deps)
-        run: |
-          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-          brew update
-          brew install xrdp
-
-      - name: Start XRDP Service
-        run: |
-          sudo brew services start xrdp
-          sleep 5
-          if ! pgrep -x "xrdp" > /dev/null; then
-            echo "XRDP failed to start"
-            exit 1
-          fi
-          echo "XRDP is running"
+          curl -fsSL "$TS_URL" -o tailscale.pkg
+          sudo installer -pkg tailscale.pkg -target /
+          rm tailscale.pkg
 
       - name: Establish Tailscale Connection
         run: |
           sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$GITHUB_RUN_ID
-          
-          # Wait for IP assignment
+
+          # Wait until Tailscale IP is assigned
           TS_IP=""
-          RETRIES=0
-          while [ -z "$TS_IP" ] && [ $RETRIES -lt 10 ]; do
-            TS_IP=$(tailscale ip -4 | head -n1)
+          for i in {1..10}; do
+            TS_IP=$(tailscale ip -4 | head -n 1)
+            if [ ! -z "$TS_IP" ]; then break; fi
             sleep 5
-            RETRIES=$((RETRIES+1))
           done
 
           if [ -z "$TS_IP" ]; then
-            echo "Tailscale IP not assigned. Exiting."
+            echo "Tailscale failed to assign IP"
             exit 1
           fi
+
           echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
 
-      - name: Show Access Info
+      - name: Verify VNC Accessibility
         run: |
-          echo "=== ACCESS INFO ==="
-          echo "RDP Address: $TAILSCALE_IP:3389"
-          echo "Username: segar"
-          echo "Password: 2503"
-          echo "==================="
+          echo "Tailscale IP: $TAILSCALE_IP"
+          nc -zv $TAILSCALE_IP 5900 || (echo "VNC port 5900 not open" && exit 1)
+          echo "VNC port is accessible!"
 
-      - name: Keep Alive
+      - name: Maintain Connection
         run: |
+          echo ""
+          echo "=== VNC ACCESS DETAILS ==="
+          echo "Address: $TAILSCALE_IP:5900"
+          echo "Password: 2503"
+          echo "==========================="
+          echo ""
           while true; do
-            echo "[$(date)] macOS RDP session active - cancel workflow to stop"
+            echo "[$(date)] VNC Active - Cancel workflow to terminate"
             sleep 300
           done
