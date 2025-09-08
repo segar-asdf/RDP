@@ -1,76 +1,111 @@
-name: macOS VNC with Tailscale
+name: RDP
 
 on:
   workflow_dispatch:
 
 jobs:
-  vnc-rdp:
-    runs-on: macos-latest
+  secure-rdp:
+    runs-on: windows-2025
     timeout-minutes: 3600
 
     steps:
-      - name: Enable Remote Management (VNC)
+      - name: Configure Core RDP Settings
         run: |
-          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
-            -activate -configure -access -on \
-            -restart -agent -privs -all -users runner
-          echo "VNC enabled for user 'runner' with all privileges."
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-      - name: Install Tailscale via Homebrew
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Disable Password Complexity Requirement
         run: |
-          brew install --cask tailscale
-          sudo tailscaled --tun=userspace-networking --socks5-server=localhost:1055 &
-          sleep 5
+          secedit /export /cfg $env:TEMP\secpol.cfg
+          (Get-Content $env:TEMP\secpol.cfg).Replace("PasswordComplexity = 1", "PasswordComplexity = 0") | Set-Content $env:TEMP\secpol.cfg
+          secedit /configure /db secedit.sdb /cfg $env:TEMP\secpol.cfg /areas SECURITYPOLICY
+          gpupdate /force
 
-      - name: Connect to Tailscale
+      - name: Create RDP User with Simple Password
         run: |
-          # Start Tailscale daemon
-          sudo nohup /Applications/Tailscale.app/Contents/MacOS/Tailscaled \
-            --tun=userspace-networking --socks5-server=localhost:1055 >/tmp/tailscaled.log 2>&1 &
-          sleep 5
+          $password = "2503"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          if (-not (Get-LocalUser -Name "SEGAR" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "SEGAR" -Password $securePass -AccountNeverExpires
+          }
+          
+          Add-LocalGroupMember -Group "Administrators" -Member "SEGAR" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "SEGAR" -ErrorAction SilentlyContinue
+          
+          echo "RDP_CREDS=User: SEGAR | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "SEGAR")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
 
-          # Bring up Tailscale with authkey (non-interactive)
-          sudo /Applications/Tailscale.app/Contents/MacOS/Tailscale up \
-            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
-            --hostname=gh-runner-$GITHUB_RUN_ID \
-            --accept-routes --accept-dns=true
-
-          # Wait for IP
-          TS_IP=""
-          for i in {1..10}; do
-            TS_IP=$(/Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4 | head -n 1)
-            if [ ! -z "$TS_IP" ]; then break; fi
-            sleep 5
-          done
-
-          if [ -z "$TS_IP" ]; then
-            echo "Tailscale failed to assign IP"
-            cat /tmp/tailscaled.log
-            exit 1
-          fi
-
-          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
-
-
-      - name: Verify VNC Accessibility
+      - name: Install Tailscale
         run: |
-          echo "Tailscale IP: $TAILSCALE_IP"
-          nc -zv $TAILSCALE_IP 5900 || (echo "VNC port not reachable" && exit 1)
-          echo "VNC port 5900 is accessible."
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-      - name: Show Connection Info
+      - name: Establish Tailscale Connection
         run: |
-          echo ""
-          echo "=== VNC ACCESS ==="
-          echo "Address (via Tailscale): $TAILSCALE_IP"
-          echo "Username: runner"
-          echo "Password: (set your VNC password manually in macOS settings if needed)"
-          echo "=================="
-          echo ""
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
 
-      - name: Keep Runner Alive
+      - name: Maintain Connection
         run: |
-          while true; do
-            echo "[$(date)] macOS VNC session active..."
-            sleep 300
-          done
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: SEGAR"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
