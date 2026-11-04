@@ -15,31 +15,41 @@ jobs:
         run: |
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name fDenyTSConnections -Value 0
+            -Name fDenyTSConnections -Value 0 -Force
 
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name UserAuthentication -Value 1
+            -Name UserAuthentication -Value 1 -Force
 
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name SecurityLayer -Value 2
+            -Name SecurityLayer -Value 2 -Force
 
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-          Set-Service TermService -StartupType Automatic
-          Start-Service TermService
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
 
       - name: Create RDP User
         shell: pwsh
         run: |
-          $password = [System.Web.Security.Membership]::GeneratePassword(24, 4)
+          # Preserve the original password-generation method.
+          try {
+            Add-Type -AssemblyName System.Web -ErrorAction Stop
+            $password = [System.Web.Security.Membership]::GeneratePassword(24, 4)
+          }
+          catch {
+            throw "The original System.Web password generator is unavailable in this PowerShell environment. No replacement generator was used."
+          }
+
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
           if (-not (Get-LocalUser -Name "SEGAR" -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name "SEGAR" -Password $securePass `
+            New-LocalUser -Name "SEGAR" `
+              -Password $securePass `
               -AccountNeverExpires
-          } else {
+          }
+          else {
             Set-LocalUser -Name "SEGAR" -Password $securePass
           }
 
@@ -49,10 +59,10 @@ jobs:
           Add-LocalGroupMember -Group "Remote Desktop Users" `
             -Member "SEGAR" -ErrorAction SilentlyContinue
 
-          # Store the generated password as a masked Actions secret
-          # for this run's logs; avoid printing it.
           Write-Host "::add-mask::$password"
           "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+          Write-Host "RDP account SEGAR configured."
 
       - name: Install ZeroTier
         shell: pwsh
@@ -61,22 +71,26 @@ jobs:
           $url = "https://download.zerotier.com/dist/ZeroTier%20One.msi"
 
           Invoke-WebRequest -Uri $url -OutFile $installer
+
           $proc = Start-Process msiexec.exe `
             -ArgumentList "/i", "`"$installer`"", "/qn", "/norestart" `
             -Wait -PassThru
 
-          Remove-Item $installer -Force
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
 
           if ($proc.ExitCode -notin @(0, 3010)) {
-            throw "ZeroTier installation failed: $($proc.ExitCode)"
+            throw "ZeroTier installation failed with exit code $($proc.ExitCode)."
           }
 
-          $service = Get-Service ZeroTierOneService -ErrorAction SilentlyContinue
+          $service = Get-Service -Name ZeroTierOneService `
+            -ErrorAction SilentlyContinue
+
           if (-not $service) {
             throw "ZeroTier service was not installed."
           }
 
-          Start-Service ZeroTierOneService
+          Start-Service -Name ZeroTierOneService
+
           $env:ZTCLI = "$env:ProgramFiles (x86)\ZeroTier\One\zerotier-cli.bat"
 
           if (-not (Test-Path $env:ZTCLI)) {
@@ -84,7 +98,7 @@ jobs:
           }
 
           if (-not (Test-Path $env:ZTCLI)) {
-            throw "Could not find zerotier-cli."
+            throw "Could not locate zerotier-cli.bat."
           }
 
       - name: Join ZeroTier Network
@@ -93,31 +107,37 @@ jobs:
           ZT_NETWORK_ID: ${{ secrets.ZEROTIER_NETWORK_ID }}
         run: |
           if ($env:ZT_NETWORK_ID -notmatch '^[a-fA-F0-9]{16}$') {
-            throw "Set the ZEROTIER_NETWORK_ID repository secret."
+            throw "Set the ZEROTIER_NETWORK_ID GitHub repository secret."
           }
 
           & $env:ZTCLI join $env:ZT_NETWORK_ID
+
           if ($LASTEXITCODE -ne 0) {
-            throw "Failed to request ZeroTier network membership."
+            throw "Failed to join the ZeroTier network."
           }
 
-          # Wait for network authorization and a managed IPv4 address.
           $ztIP = $null
+
           for ($i = 0; $i -lt 36; $i++) {
             Start-Sleep -Seconds 5
+
             $networks = & $env:ZTCLI listnetworks 2>&1
             $line = $networks |
               Where-Object { $_ -match [regex]::Escape($env:ZT_NETWORK_ID) } |
               Select-Object -First 1
 
             if ($line -match '\bACCESS_DENIED\b') {
-              Write-Host "Authorize this runner in ZeroTier Central."
-            } elseif ($line -match '\bOK\b') {
+              Write-Host "Waiting for manual authorization in ZeroTier Central."
+            }
+            elseif ($line -match '\bOK\b') {
               $matches4 = [regex]::Matches(
-                $line, '(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?:/\d+)?'
+                $line,
+                '(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?:/\d+)?'
               )
+
               foreach ($match in $matches4) {
                 $candidate = ($match.Value -split '/')[0]
+
                 if ($candidate -notlike '127.*') {
                   $ztIP = $candidate
                   break
@@ -130,22 +150,28 @@ jobs:
 
           if (-not $ztIP) {
             & $env:ZTCLI listnetworks
-            throw "No authorized ZeroTier IPv4 address obtained."
+            throw "No authorized ZeroTier IPv4 address obtained. Authorize the runner in ZeroTier Central and rerun if needed."
           }
 
           "ZT_IP=$ztIP" >> $env:GITHUB_ENV
-          Write-Host "ZeroTier IPv4: $ztIP"
+          Write-Host "ZeroTier IP: $ztIP"
 
       - name: Verify RDP
         shell: pwsh
         run: |
           $ready = $false
+
           for ($i = 0; $i -lt 12; $i++) {
-            if ((Test-NetConnection -ComputerName 127.0.0.1 `
-                -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded) {
+            $result = Test-NetConnection `
+              -ComputerName 127.0.0.1 `
+              -Port 3389 `
+              -WarningAction SilentlyContinue
+
+            if ($result.TcpTestSucceeded) {
               $ready = $true
               break
             }
+
             Start-Sleep -Seconds 5
           }
 
@@ -153,10 +179,10 @@ jobs:
             throw "RDP is not listening on TCP port 3389."
           }
 
-          Write-Host "Local RDP listener is ready."
-          Write-Host "ZeroTier address: $env:ZT_IP"
+          Write-Host "RDP listener is ready."
+          Write-Host "ZeroTier IP: $env:ZT_IP"
           Write-Host "Username: SEGAR"
-          Write-Host "Retrieve the generated password from the runner environment if needed."
+          Write-Host "Password is masked and will not be printed."
 
       - name: Keep Runner Active
         shell: pwsh
