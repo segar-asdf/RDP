@@ -25,6 +25,7 @@ jobs:
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name "SecurityLayer" -Value 0 -Force
 
+          # Remove an old rule if it exists; do not fail if absent.
           Get-NetFirewallRule -DisplayName "RDP-ZeroTier" `
             -ErrorAction SilentlyContinue |
             Remove-NetFirewallRule -ErrorAction SilentlyContinue
@@ -57,6 +58,7 @@ jobs:
       - name: Create RDP User
         shell: pwsh
         run: |
+          # Preserve the original password method.
           $password = "2503"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
@@ -145,7 +147,7 @@ jobs:
               Select-Object -First 1
 
             if ("$network" -match '\bACCESS_DENIED\b') {
-              Write-Host "Waiting for manual authorization in ZeroTier Central."
+              Write-Host "Waiting for authorization in ZeroTier Central."
             }
 
             if ("$network" -match '\bOK\b') {
@@ -168,7 +170,7 @@ jobs:
 
           if (-not $ztIP) {
             & $env:ZTCLI listnetworks
-            throw "No ZeroTier IPv4 address obtained. Authorize the runner in ZeroTier Central."
+            throw "No ZeroTier IPv4 address obtained. Authorize the runner and try again."
           }
 
           "ZT_IP=$ztIP" >> $env:GITHUB_ENV
@@ -177,16 +179,10 @@ jobs:
       - name: Configure ZeroTier RDP Firewall
         shell: pwsh
         run: |
-          $adapter = Get-NetAdapter |
-            Where-Object {
-              $_.Name -match 'ZeroTier' -or
-              $_.InterfaceDescription -match 'ZeroTier'
-            } |
-            Select-Object -First 1
-
-          if (-not $adapter) {
-            throw "ZeroTier network adapter not found."
-          }
+          # Use the actual ZeroTier IP instead of the adapter alias.
+          Get-NetFirewallRule -DisplayName "RDP-ZeroTier" `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule -ErrorAction SilentlyContinue
 
           New-NetFirewallRule `
             -DisplayName "RDP-ZeroTier" `
@@ -194,12 +190,15 @@ jobs:
             -Action Allow `
             -Protocol TCP `
             -LocalPort 3389 `
-            -InterfaceAlias $adapter.Name `
+            -LocalAddress $env:ZT_IP `
             -Profile Any
 
           $ready = $false
+
           for ($i = 0; $i -lt 12; $i++) {
-            $result = Test-NetConnection 127.0.0.1 -Port 3389 `
+            $result = Test-NetConnection `
+              -ComputerName 127.0.0.1 `
+              -Port 3389 `
               -WarningAction SilentlyContinue
 
             if ($result.TcpTestSucceeded) {
@@ -228,6 +227,6 @@ jobs:
           Write-Host "=================="
 
           while ($true) {
-            Write-Host "[$(Get-Date)] RDP Active"
+            Write-Host "[$(Get-Date)] Runner active"
             Start-Sleep -Seconds 300
           }
