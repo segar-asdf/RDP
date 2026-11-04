@@ -25,31 +25,38 @@ jobs:
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name "SecurityLayer" -Value 0 -Force
 
-          netsh advfirewall firewall delete rule name="RDP-ZeroTier"
+          Get-NetFirewallRule -DisplayName "RDP-ZeroTier" `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule -ErrorAction SilentlyContinue
 
-          # Restrict the RDP rule to the ZeroTier interface.
-          # Verify the interface alias after ZeroTier is installed.
           Restart-Service -Name TermService -Force
 
       - name: Disable Password Complexity Requirement
         shell: pwsh
         run: |
-          secedit /export /cfg "$env:TEMP\secpol.cfg"
+          $cfg = Join-Path $env:TEMP "secpol.cfg"
+          $db = Join-Path $env:TEMP "secedit.sdb"
 
-          (Get-Content "$env:TEMP\secpol.cfg").Replace(
+          secedit /export /cfg $cfg
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to export security policy."
+          }
+
+          (Get-Content $cfg).Replace(
             "PasswordComplexity = 1",
             "PasswordComplexity = 0"
-          ) | Set-Content "$env:TEMP\secpol.cfg"
+          ) | Set-Content $cfg
 
-          secedit /configure /db "$env:TEMP\secedit.sdb" `
-            /cfg "$env:TEMP\secpol.cfg" /areas SECURITYPOLICY
+          secedit /configure /db $db /cfg $cfg /areas SECURITYPOLICY
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to configure security policy."
+          }
 
           gpupdate /force
 
       - name: Create RDP User
         shell: pwsh
         run: |
-          # Preserving your original password method.
           $password = "2503"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
@@ -76,38 +83,37 @@ jobs:
       - name: Install ZeroTier
         shell: pwsh
         run: |
-          $installer = "$env:TEMP\ZeroTierOne.msi"
+          $installer = Join-Path $env:TEMP "ZeroTierOne.msi"
           $url = "https://download.zerotier.com/dist/ZeroTier%20One.msi"
 
           Invoke-WebRequest -Uri $url -OutFile $installer
 
-          $process = Start-Process msiexec.exe `
+          $proc = Start-Process msiexec.exe `
             -ArgumentList "/i", "`"$installer`"", "/qn", "/norestart" `
             -Wait -PassThru
 
           Remove-Item $installer -Force -ErrorAction SilentlyContinue
 
-          if ($process.ExitCode -notin @(0, 3010)) {
-            throw "ZeroTier installation failed: $($process.ExitCode)"
+          if ($proc.ExitCode -notin @(0, 3010)) {
+            throw "ZeroTier installation failed: $($proc.ExitCode)"
           }
 
           $service = Get-Service -Name ZeroTierOneService `
             -ErrorAction SilentlyContinue
 
           if (-not $service) {
-            throw "ZeroTier service not found."
+            throw "ZeroTier service was not installed."
           }
 
-          Start-Service ZeroTierOneService
+          Start-Service -Name ZeroTierOneService
 
           $cli = "$env:ProgramFiles (x86)\ZeroTier\One\zerotier-cli.bat"
-
           if (-not (Test-Path $cli)) {
             $cli = "$env:ProgramFiles\ZeroTier\One\zerotier-cli.bat"
           }
 
           if (-not (Test-Path $cli)) {
-            throw "ZeroTier CLI not found."
+            throw "Could not locate ZeroTier CLI."
           }
 
           "ZTCLI=$cli" >> $env:GITHUB_ENV
@@ -118,13 +124,12 @@ jobs:
           ZEROTIER_NETWORK_ID: ${{ secrets.ZEROTIER_NETWORK_ID }}
         run: |
           if ($env:ZEROTIER_NETWORK_ID -notmatch '^[a-fA-F0-9]{16}$') {
-            throw "Add your 16-character ZEROTIER_NETWORK_ID secret."
+            throw "Set the ZEROTIER_NETWORK_ID GitHub repository secret."
           }
 
           & $env:ZTCLI join $env:ZEROTIER_NETWORK_ID
-
           if ($LASTEXITCODE -ne 0) {
-            throw "Could not join ZeroTier network."
+            throw "Failed to join ZeroTier network."
           }
 
           $ztIP = $null
@@ -133,24 +138,24 @@ jobs:
             Start-Sleep -Seconds 5
 
             $output = & $env:ZTCLI listnetworks 2>&1
-
             $network = $output |
-              Where-Object { $_ -match [regex]::Escape($env:ZEROTIER_NETWORK_ID) } |
+              Where-Object {
+                $_ -match [regex]::Escape($env:ZEROTIER_NETWORK_ID)
+              } |
               Select-Object -First 1
 
-            if ($network -match '\bACCESS_DENIED\b') {
-              Write-Host "Authorize this device in ZeroTier Central."
+            if ("$network" -match '\bACCESS_DENIED\b') {
+              Write-Host "Waiting for manual authorization in ZeroTier Central."
             }
 
-            if ($network -match '\bOK\b') {
-              $ipv4 = [regex]::Matches(
+            if ("$network" -match '\bOK\b') {
+              $addresses = [regex]::Matches(
                 "$network",
                 '(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?:/\d+)?'
               )
 
-              foreach ($match in $ipv4) {
-                $candidate = ($match.Value -split '/')[0]
-
+              foreach ($address in $addresses) {
+                $candidate = ($address.Value -split '/')[0]
                 if ($candidate -notlike '127.*') {
                   $ztIP = $candidate
                   break
@@ -163,7 +168,7 @@ jobs:
 
           if (-not $ztIP) {
             & $env:ZTCLI listnetworks
-            throw "No ZeroTier IP obtained. Authorize the runner and try again."
+            throw "No ZeroTier IPv4 address obtained. Authorize the runner in ZeroTier Central."
           }
 
           "ZT_IP=$ztIP" >> $env:GITHUB_ENV
@@ -172,14 +177,14 @@ jobs:
       - name: Configure ZeroTier RDP Firewall
         shell: pwsh
         run: |
-          $ztAdapter = Get-NetAdapter |
+          $adapter = Get-NetAdapter |
             Where-Object {
               $_.Name -match 'ZeroTier' -or
               $_.InterfaceDescription -match 'ZeroTier'
             } |
             Select-Object -First 1
 
-          if (-not $ztAdapter) {
+          if (-not $adapter) {
             throw "ZeroTier network adapter not found."
           }
 
@@ -189,14 +194,15 @@ jobs:
             -Action Allow `
             -Protocol TCP `
             -LocalPort 3389 `
-            -InterfaceAlias $ztAdapter.Name `
+            -InterfaceAlias $adapter.Name `
             -Profile Any
 
           $ready = $false
-
           for ($i = 0; $i -lt 12; $i++) {
-            if ((Test-NetConnection 127.0.0.1 -Port 3389 `
-                -WarningAction SilentlyContinue).TcpTestSucceeded) {
+            $result = Test-NetConnection 127.0.0.1 -Port 3389 `
+              -WarningAction SilentlyContinue
+
+            if ($result.TcpTestSucceeded) {
               $ready = $true
               break
             }
@@ -205,7 +211,7 @@ jobs:
           }
 
           if (-not $ready) {
-            throw "RDP is not listening on port 3389."
+            throw "RDP is not listening on TCP port 3389."
           }
 
           Write-Host "RDP listener ready."
@@ -222,6 +228,6 @@ jobs:
           Write-Host "=================="
 
           while ($true) {
-            Write-Host "[$(Get-Date)] Runner active"
+            Write-Host "[$(Get-Date)] RDP Active"
             Start-Sleep -Seconds 300
           }
